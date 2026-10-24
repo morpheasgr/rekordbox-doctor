@@ -1,10 +1,17 @@
 package org.morpheas.rbdoctor;
 
+import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.app.PendingIntent;
+import android.content.BroadcastReceiver;
 import android.content.ContentResolver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.database.Cursor;
 import android.graphics.Insets;
+import android.hardware.usb.UsbDevice;
+import android.hardware.usb.UsbManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -13,6 +20,8 @@ import android.provider.DocumentsContract.Document;
 import android.util.Base64;
 import android.view.WindowInsets;
 import android.webkit.JavascriptInterface;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebViewClient;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.widget.FrameLayout;
@@ -20,6 +29,11 @@ import android.widget.FrameLayout;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
+import org.morpheas.rbdoctor.drive.DriveInfo;
+import org.morpheas.rbdoctor.drive.DriveLog;
+import org.morpheas.rbdoctor.drive.DriveSession;
+import org.morpheas.rbdoctor.drive.DriveTools;
+import org.morpheas.rbdoctor.drive.ScsiDisk;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -39,7 +53,11 @@ import java.util.concurrent.Executors;
 // This activity gives the page the files: it opens the stick or a single
 // file through the storage access framework and writes the repaired file
 // back. Files cross the bridge as base64, the bridge only passes strings.
+// The drive tools (package drive) talk to the stick over USB directly
+// instead, below the file system: they fix the partition type and format.
 public class MainActivity extends Activity {
+    private static final String ACTION_USB_PERMISSION = "org.morpheas.rbdoctor.USB_PERMISSION";
+
     private static final int PICK_STICK = 1;
     private static final int PICK_FILE = 2;
     private static final int SAVE_FILE = 3;
@@ -60,6 +78,41 @@ public class MainActivity extends Activity {
     // The file to write when the page saves a copy
     private byte[] pendingSave;
 
+    private UsbManager usb;
+    private final DriveSession drive = new DriveSession();
+    // What to do once the user allowed access to the stick
+    private Runnable afterPermission;
+
+    private final BroadcastReceiver usbEvents = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            String action = intent.getAction();
+            if (ACTION_USB_PERMISSION.equals(action)) {
+                Runnable next = afterPermission;
+                afterPermission = null;
+                // Asks UsbManager rather than trusting the broadcast: before
+                // Android 13 other apps can send it too
+                UsbDevice device = DriveSession.findStick(usb);
+                if (device != null && usb.hasPermission(device) && next != null) {
+                    next.run();
+                } else {
+                    callPage("onDrive", error("The app wasn't allowed to access the stick."));
+                }
+            } else if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(action)) {
+                UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+                if (device != null && drive.holds(device)) {
+                    io.execute(drive::release);
+                    JSONObject result = new JSONObject();
+                    try {
+                        result.put("detached", true);
+                    } catch (JSONException ignored) {
+                    }
+                    callPage("onDrive", result);
+                }
+            }
+        }
+    };
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -75,15 +128,51 @@ public class MainActivity extends Activity {
         web = new WebView(this);
         web.setBackgroundColor(getColor(R.color.background));
         WebSettings settings = web.getSettings();
+        // The page of the app and the engine are JavaScript; nothing else loads
         settings.setJavaScriptEnabled(true);
+        settings.setAllowFileAccess(false);
+        settings.setAllowContentAccess(false);
         settings.setDomStorageEnabled(true);
         web.addJavascriptInterface(new Bridge(), "Android");
+        // Only the page of the app runs in here, with the bridge: links go to
+        // the browser
+        web.setWebViewClient(new WebViewClient() {
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                Uri url = request.getUrl();
+                if ("file".equals(url.getScheme()) && url.getPath() != null && url.getPath().startsWith("/android_asset/")) {
+                    return false;
+                }
+                try {
+                    startActivity(new Intent(Intent.ACTION_VIEW, url));
+                } catch (Exception ignored) {
+                }
+                return true;
+            }
+        });
         root.addView(web);
         setContentView(root);
+
+        usb = (UsbManager) getSystemService(USB_SERVICE);
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(ACTION_USB_PERMISSION);
+        filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
+        registerUsbEvents(filter);
         if (savedInstanceState != null) {
             web.restoreState(savedInstanceState);
         } else {
             web.loadUrl("file:///android_asset/index.html");
+        }
+    }
+
+    // Before Android 13 a receiver can't be kept to the app; usbEvents
+    // doesn't trust what it receives
+    @SuppressLint("UnspecifiedRegisterReceiverFlag")
+    private void registerUsbEvents(IntentFilter filter) {
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(usbEvents, filter, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            registerReceiver(usbEvents, filter);
         }
     }
 
@@ -104,7 +193,10 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
-        io.shutdownNow();
+        unregisterReceiver(usbEvents);
+        // Gives the stick back to Android
+        io.execute(drive::release);
+        io.shutdown();
         super.onDestroy();
     }
 
@@ -175,6 +267,56 @@ public class MainActivity extends Activity {
             io.execute(() -> callPage("onWritten", replaceOnStick(repaired)));
         }
 
+        // -- drive tools; the page gets onDrive() --
+
+        // Takes the stick over from Android and reads its partition table
+        @JavascriptInterface
+        public void driveOpen() {
+            runOnUiThread(() -> {
+                UsbDevice device = DriveSession.findStick(usb);
+                if (device == null) {
+                    callPage("onDrive", error("No USB stick is plugged in. Plug it in (with an OTG adapter) and try again."));
+                    return;
+                }
+                withPermission(device, () -> io.execute(() -> callPage("onDrive", driveInfo(device, null))));
+            });
+        }
+
+        @JavascriptInterface
+        public void driveFixType(int slot) {
+            driveWrite(disk -> {
+                int type = DriveTools.fixPartitionType(disk, slot);
+                return String.format(Locale.US, "The type of partition %d is now 0x%02X.", slot, type);
+            });
+        }
+
+        @JavascriptInterface
+        public void driveFormat(String label) {
+            driveWrite(disk -> {
+                DriveTools.formatFat32(disk, label);
+                return "The stick is now FAT32, empty.";
+            });
+        }
+
+        // Gives the stick back to Android, which mounts it again
+        @JavascriptInterface
+        public void driveRelease() {
+            io.execute(() -> {
+                drive.release();
+                JSONObject result = new JSONObject();
+                try {
+                    result.put("released", true);
+                } catch (JSONException ignored) {
+                }
+                callPage("onDrive", result);
+            });
+        }
+
+        @JavascriptInterface
+        public String driveLog() {
+            return DriveLog.text();
+        }
+
         @JavascriptInterface
         public String version() {
             try {
@@ -213,6 +355,89 @@ public class MainActivity extends Activity {
             io.execute(() -> callPage("onFile", openStick(uri)));
         } else if (requestCode == PICK_FILE) {
             io.execute(() -> callPage("onFile", openFile(uri)));
+        }
+    }
+
+    // -- drive tools ---------------------------------------------------------
+
+    private interface DriveWork {
+        /** Returns what was done, for the user */
+        String run(ScsiDisk disk) throws IOException;
+    }
+
+    // Runs work once access to the stick is allowed, asking for it if needed
+    private void withPermission(UsbDevice device, Runnable work) {
+        if (usb.hasPermission(device)) {
+            work.run();
+            return;
+        }
+        afterPermission = work;
+        // The system fills in the extras, so this has to be mutable on Android 12+
+        int flags = Build.VERSION.SDK_INT >= 31 ? PendingIntent.FLAG_MUTABLE : 0;
+        PendingIntent pending = PendingIntent.getBroadcast(this, 0,
+                new Intent(ACTION_USB_PERMISSION).setPackage(getPackageName()), flags);
+        usb.requestPermission(device, pending);
+    }
+
+    private void driveWrite(DriveWork work) {
+        runOnUiThread(() -> {
+            UsbDevice device = DriveSession.findStick(usb);
+            if (device == null || !drive.holds(device)) {
+                callPage("onDrive", error("The stick isn't open any more. Open it again."));
+                return;
+            }
+            web.setKeepScreenOn(true);
+            io.execute(() -> {
+                String done;
+                try {
+                    done = work.run(drive.acquire(usb, device));
+                } catch (Exception e) {
+                    DriveLog.log("failed: " + messageOf(e));
+                    callPage("onDrive", driveInfo(device, "Failed: " + messageOf(e)));
+                    web.post(() -> web.setKeepScreenOn(false));
+                    return;
+                }
+                callPage("onDrive", driveInfo(device, done));
+                web.post(() -> web.setKeepScreenOn(false));
+            });
+        });
+    }
+
+    // Opens the stick if needed and describes it; done is what was just
+    // done to it, or why that failed (starting with "Failed")
+    private JSONObject driveInfo(UsbDevice device, String done) {
+        try {
+            ScsiDisk disk = drive.acquire(usb, device);
+            DriveInfo info = DriveInfo.inspect(disk);
+            JSONObject result = new JSONObject();
+            if (done != null) {
+                result.put(done.startsWith("Failed") ? "failed" : "done", done);
+            }
+            result.put("name", disk.product.isEmpty() ? DriveSession.describe(device) : disk.product);
+            result.put("bytes", info.sectorCount * info.sectorSize);
+            result.put("writeProtected", disk.writeProtected);
+            result.put("table", info.table.name());
+            JSONArray partitions = new JSONArray();
+            for (DriveInfo.Partition p : info.partitions) {
+                JSONObject part = new JSONObject();
+                part.put("slot", p.slot);
+                part.put("type", p.type);
+                part.put("typeName", p.type >= 0 ? DriveInfo.typeName(p.type) : "");
+                part.put("fs", p.fs != null ? p.fs : "");
+                part.put("label", p.label);
+                part.put("bytes", p.sectors * info.sectorSize);
+                part.put("mismatch", p.typeMismatch());
+                part.put("expectedType", p.expectedType());
+                partitions.put(part);
+            }
+            result.put("partitions", partitions);
+            result.put("problems", new JSONArray(info.playerProblems()));
+            return result;
+        } catch (Exception e) {
+            DriveLog.log("open failed: " + messageOf(e));
+            drive.release();
+            return error((done != null ? done + " " : "") + "Can't read the stick: " + messageOf(e)
+                    + " Unplug it, plug it in again while the app is open, and retry.");
         }
     }
 

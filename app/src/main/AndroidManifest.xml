@@ -1,6 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- For the drive tools, which talk to the stick over USB directly -->
+    <uses-feature
+        android:name="android.hardware.usb.host"
+        android:required="false" />
+
     <application
         android:allowBackup="false"
         android:icon="@mipmap/ic_launcher"

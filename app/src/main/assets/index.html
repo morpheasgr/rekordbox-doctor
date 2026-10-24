@@ -81,6 +81,17 @@
   footer { color: var(--dim); font-size: 12px; margin: 28px 0 8px; }
   footer a { color: var(--dim); }
   [hidden] { display: none !important; }
+  .section { color: var(--dim); font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; margin: 26px 0 8px; }
+  .parts { width: 100%; border-collapse: collapse; font-size: 14px; margin: 4px 0 10px; }
+  .parts td { padding: 6px 4px; border-top: 1px solid var(--line); vertical-align: top; }
+  .parts td:first-child { color: var(--dim); white-space: nowrap; }
+  input[type=text] {
+    font: inherit; color: var(--text); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; width: 100%; margin: 4px 0 10px;
+  }
+  label { font-size: 14px; color: var(--dim); }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; color: var(--dim); max-height: 300px; overflow: auto; }
+  a.link { color: var(--dim); font-size: 13px; }
 </style>
 </head>
 <body>
@@ -92,6 +103,10 @@
 
 <div id="status"></div>
 <div id="result"></div>
+
+<p class="section">Partition &amp; format</p>
+<button id="openDrive">Check the stick’s partition table<small>Players need an MBR table with FAT32. Can fix the partition type, or format the stick as FAT32.</small></button>
+<div id="drive"></div>
 
 <footer>
   <p>The repair engine is
@@ -153,7 +168,13 @@ function plural(n, one, many) {
 function setButtons(enabled) {
   $('openStick').disabled = !enabled
   $('openFile').disabled = !enabled
-  for (const b of $('result').querySelectorAll('button')) b.disabled = !enabled
+  $('openDrive').disabled = !enabled
+  for (const b of document.querySelectorAll('#result button, #drive button')) b.disabled = !enabled
+  // Buttons that stay off whatever else happens
+  if (enabled && $('format')) $('format').disabled = $('confirm').value.trim().toUpperCase() !== 'ERASE'
+  if (enabled && drive.info && drive.info.writeProtected) {
+    for (const b of document.querySelectorAll('#drive button.fix, #formatOpen, #format')) b.disabled = true
+  }
 }
 
 function busy(text) {
@@ -313,6 +334,136 @@ function onSaved(result) {
   $('status').innerHTML = `<div class="card"><span class="badge healthy">Saved</span>
     <p>${esc(`The repaired copy is ${result.name}.`)}</p></div>`
   setButtons(true)
+}
+
+// -- drive tools ---------------------------------------------------------
+
+const drive = { info: null, formatOpen: false, logOpen: false }
+
+$('openDrive').onclick = () => {
+  if (!bridge.driveOpen) {
+    message('The drive tools work only in the app.', 'damaged')
+    return
+  }
+  // Android unmounts the stick while the app holds it, so what was opened
+  // through the file picker is gone
+  $('result').innerHTML = ''
+  busy('Opening the stick… Allow access when Android asks.')
+  bridge.driveOpen()
+}
+
+function gb(bytes) {
+  return bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)}\u00a0GB` : `${Math.round(bytes / 1e6)}\u00a0MB`
+}
+
+function hex(type) {
+  return '0x' + type.toString(16).toUpperCase().padStart(2, '0')
+}
+
+// Called by the app with the stick, or {error}, {released} or {detached}
+function onDrive(result) {
+  setButtons(true)
+  $('status').innerHTML = ''
+  if (result.error || result.released || result.detached) {
+    drive.info = null
+    drive.formatOpen = false
+    const text = result.error ||
+      (result.released ? 'The stick is back with Android. It shows up again in a few seconds.' : 'The stick was unplugged.')
+    $('drive').innerHTML = `<div class="card"><span class="badge ${result.error ? 'damaged' : 'healthy'}">${esc(result.error ? 'Problem' : 'Done')}</span>
+      <p>${esc(text)}</p>${result.error ? logHtml() : ''}</div>`
+    bindLog()
+    return
+  }
+  drive.info = result
+  renderDrive()
+}
+
+function logHtml() {
+  if (!bridge.driveLog) return ''
+  return drive.logOpen
+    ? `<a class="link" href="#" id="logToggle">Hide the log</a><pre>${esc(bridge.driveLog())}</pre>`
+    : `<a class="link" href="#" id="logToggle">Show the log</a>`
+}
+
+function bindLog() {
+  const toggle = $('logToggle')
+  if (toggle) toggle.onclick = (e) => {
+    e.preventDefault()
+    drive.logOpen = !drive.logOpen
+    if (drive.info) renderDrive()
+    else toggle.parentElement.querySelector('pre')?.remove()
+  }
+}
+
+function renderDrive() {
+  const d = drive.info
+  let html = ''
+  if (d.done) html += `<div class="card"><span class="badge healthy">Done</span><p>${esc(d.done)}</p></div>`
+  if (d.failed) html += `<div class="card"><span class="badge damaged">Failed</span><p>${esc(d.failed)}</p></div>`
+  const ok = d.problems.length === 0
+  html += `<div class="card">
+    <h2>${esc(d.name)}</h2>
+    <p class="where">${gb(d.bytes)} · ${esc(d.table === 'NONE' ? 'no partition table' : d.table + ' partition table')}</p>
+    <span class="badge ${ok ? 'healthy' : 'damaged'}">${ok ? 'Players can read it' : 'Players may not read it'}</span>`
+  if (d.partitions.length) {
+    html += '<table class="parts">'
+    for (const p of d.partitions) {
+      const type = p.type >= 0 ? ` · type ${hex(p.type)} (${esc(p.typeName)})` : ''
+      html += `<tr><td>Partition ${p.slot}</td><td>${esc(p.fs || 'unknown file system')}${p.label ? ` “${esc(p.label)}”` : ''} · ${gb(p.bytes)}${type}</td></tr>`
+    }
+    html += '</table>'
+  }
+  if (!ok) html += `<ul>${d.problems.map((p) => `<li>${esc(p)}</li>`).join('')}</ul>`
+  if (d.writeProtected) html += `<p>The stick reports that it is write-protected: nothing can be changed on it.</p>`
+  html += '</div>'
+
+  for (const p of d.partitions.filter((p) => p.mismatch)) {
+    html += `<div class="card"><h2>Fix the partition type</h2>
+      <p>Sets the type of partition ${p.slot} to ${hex(p.expectedType)}, which matches its ${esc(p.fs)}
+      file system. Only that one byte of the partition table changes; the files stay as they are.</p>
+      <button class="primary fix" data-slot="${p.slot}">Fix partition ${p.slot}</button></div>`
+  }
+
+  const first = d.partitions[0]
+  const label = first && first.label ? first.label : 'REKORDBOX'
+  html += `<div class="card"><h2>Format as FAT32</h2>
+    <p>One MBR partition with FAT32 over the whole stick, which every Pioneer player reads, for any
+    size of stick. <b>Everything on the stick is erased</b>, music included: export it again from
+    rekordbox afterwards.</p>`
+  if (drive.formatOpen) {
+    html += `<label for="label">Name of the stick (up to 11 letters)</label>
+      <input type="text" id="label" maxlength="11" value="${esc(label)}" autocapitalize="characters">
+      <label for="confirm">Type ERASE to confirm</label>
+      <input type="text" id="confirm" autocapitalize="characters" autocomplete="off">
+      <button class="danger" id="format" disabled>Erase and format</button>`
+  } else {
+    html += `<button id="formatOpen">Format…</button>`
+  }
+  html += '</div>'
+
+  html += `<button class="primary" id="release">Done: give the stick back to Android<small>Until then it doesn’t show up in other apps</small></button>`
+  html += logHtml()
+  $('drive').innerHTML = html
+
+  for (const button of $('drive').querySelectorAll('button.fix')) {
+    button.onclick = () => {
+      busy('Fixing the partition type…')
+      bridge.driveFixType(Number(button.dataset.slot))
+    }
+  }
+  const open = $('formatOpen')
+  if (open) open.onclick = () => { drive.formatOpen = true; renderDrive() }
+  const confirm = $('confirm')
+  if (confirm) confirm.oninput = () => { $('format').disabled = confirm.value.trim().toUpperCase() !== 'ERASE' }
+  const format = $('format')
+  if (format) format.onclick = () => {
+    drive.formatOpen = false
+    busy('Formatting… Keep the stick plugged in.')
+    bridge.driveFormat($('label').value)
+  }
+  $('release').onclick = () => { busy('Giving the stick back…'); bridge.driveRelease() }
+  bindLog()
+  if (d.writeProtected) for (const b of $('drive').querySelectorAll('button.fix, #formatOpen')) b.disabled = true
 }
 
 const version = bridge.version()

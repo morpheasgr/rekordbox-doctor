@@ -19,6 +19,16 @@ in the app's folder on the phone, and in a `Rekordbox Doctor backups` folder
 on the stick. A single `export.pdb` can also be opened, and a repaired copy
 saved anywhere.
 
+It also checks the stick itself, below the files: the partition table and the
+file system. Pioneer players read MBR sticks with FAT32 (or FAT16), and
+Android formats sticks larger than 32 GB as exFAT, under the partition type
+of FAT32. The app can set the partition type to match the file system,
+changing that one byte only, or format the stick as FAT32, at any size. For
+this it talks to the stick over USB directly (the USB host API, no root), so
+Android unmounts the stick until the app gives it back. Plug the stick in
+while the app is open: one Android mounted earlier may not be taken over
+cleanly.
+
 Only `export.pdb` is checked. `exportLibrary.db`, the library of newer
 players such as the CDJ-3000, isn't.
 
@@ -33,6 +43,12 @@ upstream command line tool. `tools/build-engine.sh` bundles it into
 the app, `app/src/main/assets/index.html`. `MainActivity.java` opens the
 stick through the storage access framework and writes the result back. No
 permissions are needed.
+
+The drive tools in `app/src/main/java/org/morpheas/rbdoctor/drive` are ported
+from [usbformat](https://github.com/blackorange-sketch/usbformat) (MIT), see
+`third_party/usbformat`. `tools/drive-test/run.sh` tries them on a PC, on
+image files and a fake USB stick, and checks the results with `fsck.fat`,
+`fsck.exfat`, `sfdisk` and `mtools`.
 
 The bundle is committed, so building the app needs no Node:
 
