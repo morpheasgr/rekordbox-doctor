@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Rekordbox Doctor</title>
+<style>
+  :root {
+    --bg: #101114;
+    --panel: #181a1f;
+    --line: #2a2d34;
+    --text: #e6e8eb;
+    --dim: #9aa0a8;
+    --accent: #2fbf8f;
+    --warn: #f0a020;
+    --bad: #e5483a;
+    --button: #23262d;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body {
+    font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: 16px;
+    max-width: 640px;
+    margin: 0 auto;
+  }
+  h1 { font-size: 22px; margin: 4px 0 2px; }
+  .sub { color: var(--dim); margin: 0 0 18px; font-size: 14px; }
+  button {
+    font: inherit;
+    font-weight: 600;
+    color: var(--text);
+    background: var(--button);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 14px 16px;
+    width: 100%;
+    margin: 0 0 10px;
+    text-align: left;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #06140f; }
+  button.danger { background: var(--warn); border-color: var(--warn); color: #1a1000; }
+  button:disabled { opacity: 0.5; }
+  button small { display: block; font-weight: 400; font-size: 13px; opacity: 0.8; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 14px 16px;
+    margin: 16px 0;
+  }
+  .card h2 { font-size: 17px; margin: 0 0 8px; }
+  .where { color: var(--dim); font-size: 13px; margin: 0 0 10px; }
+  .card p, .card li { overflow-wrap: anywhere; }
+  .badge {
+    display: inline-block;
+    border-radius: 999px;
+    padding: 3px 12px;
+    font-weight: 700;
+    font-size: 14px;
+    margin: 0 0 10px;
+  }
+  .healthy { background: rgba(47, 191, 143, 0.15); color: var(--accent); }
+  .freezes { background: rgba(240, 160, 32, 0.15); color: var(--warn); }
+  .damaged, .unreadable { background: rgba(229, 72, 58, 0.15); color: var(--bad); }
+  .counts { display: flex; gap: 8px; margin: 4px 0 10px; }
+  .count { flex: 1; background: var(--bg); border-radius: 8px; padding: 8px 10px; }
+  .count b { display: block; font-size: 20px; font-variant-numeric: tabular-nums; }
+  .count span { color: var(--dim); font-size: 12px; }
+  ul { margin: 6px 0 10px; padding-left: 20px; }
+  li { margin: 2px 0; }
+  p { margin: 6px 0 10px; }
+  .dim { color: var(--dim); font-size: 14px; }
+  .busy { display: flex; align-items: center; gap: 10px; color: var(--dim); }
+  .spinner {
+    width: 18px; height: 18px; border-radius: 50%;
+    border: 2px solid var(--line); border-top-color: var(--accent);
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  footer { color: var(--dim); font-size: 12px; margin: 28px 0 8px; }
+  footer a { color: var(--dim); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<h1>Rekordbox Doctor</h1>
+<p class="sub">Checks and repairs the library rekordbox exports to a USB stick, the export.pdb CDJs and XDJs read.</p>
+
+<button class="primary" id="openStick">Open a USB stick<small>Pick the stick itself in the list that opens</small></button>
+<button id="openFile">Open a single export.pdb<small>A copy on the phone, for example</small></button>
+
+<div id="status"></div>
+<div id="result"></div>
+
+<footer>
+  <p>The repair engine is
+  <a href="https://github.com/themisterchong/rekordbox-usb-repair">rekordbox-usb-repair</a>
+  by themisterchong, MIT licensed. It rebuilds the file from every row that can still be
+  read and puts long strings on a 4-byte boundary, which XDJ-700 and CDJ-2000NXS2 need.</p>
+  <p>Not affiliated with AlphaTheta or Pioneer DJ. rekordbox is their trademark.
+  <span id="version"></span></p>
+</footer>
+
+<script src="engine.js"></script>
+<script>
+'use strict'
+
+// Without the app, in a browser, a file input stands in for the bridge
+const bridge = window.Android || (() => {
+  let file = ''
+  const input = document.createElement('input')
+  input.type = 'file'
+  input.onchange = () => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      file = reader.result.split(',')[1] || ''
+      onFile({ mode: 'file', name: input.files[0].name, size: input.files[0].size })
+    }
+    reader.readAsDataURL(input.files[0])
+  }
+  return {
+    pickStick: () => input.click(),
+    pickFile: () => input.click(),
+    takeFile: () => file,
+    saveCopy: (b64) => {
+      const a = document.createElement('a')
+      a.href = 'data:application/octet-stream;base64,' + b64
+      a.download = 'export.pdb'
+      a.click()
+      onSaved({ ok: true, name: 'export.pdb' })
+    },
+    writeToStick: () => onWritten({ error: 'Not in the app.' }),
+    version: () => '',
+  }
+})()
+
+const $ = (id) => document.getElementById(id)
+const state = { info: null, base64: '', check: null, repair: null }
+
+function esc(text) {
+  return String(text).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c])
+}
+
+function size(bytes) {
+  return bytes < 1024 * 1024 ? `${Math.round(bytes / 1024)}\u00a0KB` : `${(bytes / 1024 / 1024).toFixed(1)}\u00a0MB`
+}
+
+function plural(n, one, many) {
+  return `${n.toLocaleString()} ${n === 1 ? one : many}`
+}
+
+function setButtons(enabled) {
+  $('openStick').disabled = !enabled
+  $('openFile').disabled = !enabled
+  for (const b of $('result').querySelectorAll('button')) b.disabled = !enabled
+}
+
+function busy(text) {
+  $('status').innerHTML = `<div class="card busy"><div class="spinner"></div>${esc(text)}</div>`
+  setButtons(false)
+}
+
+function message(text, kind) {
+  $('status').innerHTML = text ? `<div class="card"><span class="badge ${kind || ''}">${esc(text)}</span></div>` : ''
+  setButtons(true)
+}
+
+// Lets the page draw the spinner before the engine blocks it
+function later(work) {
+  requestAnimationFrame(() => setTimeout(work, 30))
+}
+
+$('openStick').onclick = () => { busy('Waiting for the stick…'); bridge.pickStick() }
+$('openFile').onclick = () => { busy('Waiting for the file…'); bridge.pickFile() }
+
+const VERDICTS = {
+  healthy: ['Healthy', 'The library reads cleanly and every long string is aligned.'],
+  freezes: ['Freezes some players', 'The library reads cleanly, but long strings are off a 4-byte boundary. An XDJ-700 (firmware 1.15) or CDJ-2000NXS2 freezes when this stick goes in.'],
+  damaged: ['Damaged', 'Parts of the library can’t be read. Players may show missing tracks or playlists, or refuse the stick.'],
+  unreadable: ['Unreadable', 'The file can’t be read as a rekordbox library at all.'],
+}
+
+function countsHtml(c) {
+  return `<div class="counts">
+    <div class="count"><b>${c.tracks.toLocaleString()}</b><span>tracks</span></div>
+    <div class="count"><b>${c.playlists.toLocaleString()}</b><span>playlists &amp; folders</span></div>
+    <div class="count"><b>${c.playlistEntries.toLocaleString()}</b><span>playlist entries</span></div>
+  </div>`
+}
+
+// Called by the app with the file it opened, or {error}
+function onFile(info) {
+  if (info.error) {
+    message(info.error === 'cancelled' ? '' : info.error, 'damaged')
+    return
+  }
+  state.info = info
+  busy('Checking the library…')
+  later(() => {
+    state.base64 = bridge.takeFile()
+    state.repair = null
+    try {
+      state.check = Engine.check(state.base64)
+    } catch (err) {
+      state.check = { readable: false, error: String(err), damaged: [], misaligned: 0, filePaths: [], repairable: false, verdict: 'unreadable' }
+    }
+    if (!state.base64) {
+      state.check = { readable: false, error: 'The file is empty.', damaged: [], misaligned: 0, filePaths: [], repairable: false, verdict: 'unreadable' }
+    }
+    render()
+  })
+}
+
+function render() {
+  const { info, check } = state
+  const [title, explanation] = VERDICTS[check.verdict]
+  const where = info.mode === 'stick' ? `${info.name} › ${info.path}` : info.name
+  let html = `<div class="card">
+    <h2>${esc(info.mode === 'stick' ? 'USB stick' : 'File')}</h2>
+    <p class="where">${esc(where)} · ${size(info.size)}</p>
+    <span class="badge ${check.verdict}">${esc(title)}</span>
+    <p>${esc(explanation)}</p>`
+  if (check.counts) html += countsHtml(check.counts)
+  // Each damaged page of a table is reported once per table it breaks
+  const problems = [...new Set(check.damaged)]
+  if (check.error) problems.unshift(check.error)
+  if (check.misaligned) problems.push(`${plural(check.misaligned, 'long string is', 'long strings are')} misaligned`)
+  if (problems.length) html += `<ul>${problems.map((p) => `<li>${esc(p)}</li>`).join('')}</ul>`
+  html += '</div>'
+
+  if (check.verdict !== 'healthy') {
+    if (check.repairable && check.recoverable) {
+      html += `<div class="card"><h2>Repair</h2>
+        <p>A rebuild recovers:</p>${countsHtml(check.recoverable)}`
+      if (check.counts && check.recoverable.tracks < check.counts.tracks) {
+        html += `<p class="dim">Fewer tracks than the library lists: those rows are damaged beyond reading.</p>`
+      }
+      if (info.mode === 'stick') {
+        html += `<p class="dim">The original is backed up first, to the phone and to a
+          “Rekordbox Doctor backups” folder on the stick, and only replaced once the rebuilt
+          file has been written and read back.</p>
+          <button class="danger" id="repair">Repair the stick</button>`
+      } else {
+        html += `<button class="danger" id="repair">Save a repaired copy…<small>The opened file stays as it is</small></button>`
+      }
+      html += '</div>'
+    } else {
+      html += `<div class="card"><h2>Can’t repair</h2>
+        <p>Nothing could be rebuilt from this file. Export the library to the stick again
+        from rekordbox (in rekordbox: the stick in the Devices list, then Export).</p></div>`
+    }
+  }
+  if (info.mode === 'stick' && info.others && info.others.some((n) => /^exportLibrary\.db$/i.test(n))) {
+    html += `<div class="card"><p class="dim">This stick also has exportLibrary.db, the library of
+      newer players (CDJ-3000, OPUS-QUAD and others). This app checks only export.pdb.</p></div>`
+  }
+  $('status').innerHTML = ''
+  $('result').innerHTML = html
+  setButtons(true)
+  const button = $('repair')
+  if (button) button.onclick = repair
+}
+
+function repair() {
+  busy('Rebuilding the library…')
+  later(() => {
+    let result
+    try {
+      result = Engine.repair(state.base64)
+    } catch (err) {
+      result = { ok: false, problems: [String(err)] }
+    }
+    if (!result.ok) {
+      message(`Not repaired: ${result.problems.join('; ')}`, 'damaged')
+      return
+    }
+    state.repair = result
+    if (state.info.mode === 'stick') {
+      busy('Writing to the stick… Keep it plugged in.')
+      bridge.writeToStick(result.output)
+    } else {
+      busy('Choose where to save…')
+      bridge.saveCopy(result.output)
+    }
+  })
+}
+
+// Called by the app once export.pdb on the stick has been replaced, or {error}
+function onWritten(result) {
+  if (result.error) {
+    message(result.error, 'damaged')
+    return
+  }
+  const backups = `Backups of the original: ${result.backupOnStick} on the stick, and ${result.backupInApp} on the phone.`
+  state.info.size = result.size
+  // Checks what the stick holds now
+  onFile(state.info)
+  const done = () => {
+    if ($('status').querySelector('.spinner')) return setTimeout(done, 100)
+    $('status').innerHTML = `<div class="card"><span class="badge healthy">Repaired</span>
+      <p>${esc(backups)}</p><p class="dim">Eject the stick from the phone before unplugging it.</p></div>`
+  }
+  done()
+}
+
+// Called by the app once a copy was saved, or {error}
+function onSaved(result) {
+  if (result.error) {
+    message(result.error === 'cancelled' ? '' : result.error, 'damaged')
+    return
+  }
+  $('status').innerHTML = `<div class="card"><span class="badge healthy">Saved</span>
+    <p>${esc(`The repaired copy is ${result.name}.`)}</p></div>`
+  setButtons(true)
+}
+
+const version = bridge.version()
+if (version) $('version').textContent = `Version ${version}.`
+</script>
+</body>
+</html>

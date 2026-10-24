@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A USB stick with a medical cross, inside the 66dp safe zone -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FF8A8F98"
+        android:pathData="M45,26h18v12h-18z" />
+    <path
+        android:fillColor="#FF101114"
+        android:pathData="M49,30h3v4h-3zM56,30h3v4h-3z" />
+    <path
+        android:fillColor="#FF2FBF8F"
+        android:pathData="M38,38h32a4,4 0,0 1,4 4v36a4,4 0,0 1,-4 4h-32a4,4 0,0 1,-4 -4v-36a4,4 0,0 1,4 -4z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M50,48h8v8h8v8h-8v8h-8v-8h-8v-8h8z" />
+</vector>

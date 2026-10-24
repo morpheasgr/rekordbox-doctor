@@ -1,0 +1,159 @@
+--- a/src/engine/pdb/pdbEditor.ts
++++ b/src/engine/pdb/pdbEditor.ts
+@@ -25,7 +25,7 @@
+  * (e.g. the user's own corrupted-but-mostly-intact file, or a captured
+  * real-Rekordbox template). See plan §3 Tier 0.
+  */
+-import { Album, Database, TableType } from './pdbReader'
++import { Album, Database, PlaylistEntry, PlaylistTreeNode, TableType } from './pdbReader'
+ import { encodeString, stringByteLength } from './pdbStrings'
+ 
+ const PAGE_HEADER_SIZE = 0x28
+@@ -159,6 +159,11 @@
+ export class PdbEditor {
+   private buf: Buffer
+   private dbCache: Database | null = null
++  // Rows of single tables for the lookups of addTrack(), getOrCreate() and
++  // addToPlaylist(), kept across appends to other tables, with the rows
++  // those lookups appended added. A rebuild appends thousands of rows, and
++  // reparsing the whole file for each lookup made it quadratic.
++  private rowCache = new Map<number, unknown[]>()
+   readonly pageSize: number
+ 
+   // Per-page append bookkeeping (page_index -> value).
+@@ -200,8 +205,10 @@
+     return this.dbCache
+   }
+ 
+-  private invalidateDb(): void {
++  private invalidateDb(appendedTo?: number): void {
+     this.dbCache = null
++    if (appendedTo === undefined) this.rowCache.clear()
++    else this.rowCache.delete(appendedTo)
+   }
+ 
+   // -- low-level helpers ---------------------------------------------------
+@@ -379,6 +386,24 @@
+     return true
+   }
+ 
++  /** The rows of one table, from rowCache when there. */
++  private cachedRows<T>(tableType: number): T[] {
++    let rows = this.rowCache.get(tableType)
++    if (!rows) {
++      rows = [...this.db.rows(tableType)]
++      this.rowCache.set(tableType, rows)
++    }
++    return rows as T[]
++  }
++
++  /** appendRow() for a table whose rows are cached: keeps them, with this one. */
++  private appendCachedRow(tableType: number, parsed: unknown, row: Buffer, alloc: number, indexShiftAt?: number): void {
++    const rows = this.cachedRows(tableType)
++    this.appendRow(tableType, row, alloc, indexShiftAt)
++    rows.push(parsed)
++    this.rowCache.set(tableType, rows)
++  }
++
+   // -- appending rows -------------------------------------------------------
+ 
+   private slotCount(pageOff: number): number {
+@@ -479,7 +504,8 @@
+     this.buf.writeUInt16LE(this.pageSize - PAGE_HEADER_SIZE - used - PdbEditor.dirBytes(newN), pageOff + 0x1c)
+     this.buf.writeUInt16LE(this.appends.get(pageIndex)!, pageOff + 0x20)
+     this.buf.writeUInt16LE(this.origSlots.get(pageIndex)!, pageOff + 0x22)
+-    this.invalidateDb()
++    // Appending a row leaves the rows of the other tables as they were
++    this.invalidateDb(tableType)
+   }
+ 
+   private presentCount(pageOff: number, n: number): number {
+@@ -556,7 +582,7 @@
+   private getOrCreate(
+     tableType: number,
+     name: string,
+-    build: (id: number, name: string) => { row: Buffer; alloc: number; indexShiftAt?: number },
++    build: (id: number, name: string) => { row: Buffer; alloc: number; indexShiftAt?: number; cached?: object },
+     // Real devices can hold multiple albums that share an identical name
+     // (different artists' own "Best Of", "Remixes", etc. - confirmed on a
+     // real 1293-track device: 23 such name collisions, each a genuinely
+@@ -569,16 +595,18 @@
+     // ones when artist ids were renumbered), so a rebuild keeps them.
+     preferredId?: number
+   ): number {
+-    for (const row of this.db.rows(tableType) as Array<{ id: number; name: string }>) {
++    const rows = this.cachedRows<{ id: number; name: string }>(tableType)
++    for (const row of rows) {
+       if (row.name === name && (!extraMatch || extraMatch(row))) return row.id
+     }
+-    const existingIds = (this.db.rows(tableType) as Array<{ id: number }>).map((r) => r.id)
++    const existingIds = rows.map((r) => r.id)
+     const newId =
+       preferredId && !existingIds.includes(preferredId)
+         ? preferredId
+         : (existingIds.length ? Math.max(...existingIds) : 0) + 1
+     const built = build(newId, name)
+-    this.appendRow(tableType, built.row, built.alloc, built.indexShiftAt)
++    // What the lookups read of the row: ALBUMS also match on artistId
++    this.appendCachedRow(tableType, { id: newId, name, ...built.cached }, built.row, built.alloc, built.indexShiftAt)
+     return newId
+   }
+ 
+@@ -656,7 +684,7 @@
+     return this.getOrCreate(
+       TableType.ALBUMS,
+       name,
+-      (id, n) => PdbEditor.buildAlbumRow(id, n, artistId),
++      (id, n) => ({ ...PdbEditor.buildAlbumRow(id, n, artistId), cached: { artistId } }),
+       (row) => (row as Album).artistId === artistId,
+       preferredId
+     )
+@@ -771,13 +799,14 @@
+     const keyId = opts.key ? this.getOrCreateKey(opts.key) : 0
+     const labelId = opts.label ? this.getOrCreateLabel(opts.label) : 0
+ 
+-    const existingTrackIds = this.db.tracks.map((t) => t.id)
++    const trackRows = this.cachedRows<{ id: number; masterContentId: number }>(TableType.TRACKS)
++    const existingTrackIds = trackRows.map((t) => t.id)
+     if (opts.id !== undefined && existingTrackIds.includes(opts.id)) throw new Error(`track id ${opts.id} already exists`)
+     const trackId = opts.id ?? (existingTrackIds.length ? Math.max(...existingTrackIds) : 0) + 1
+ 
+     // Unique per-track value at 0x14 (purpose unknown; unique in every
+     // real export, so keep it unique here too).
+-    const seen = new Set(this.db.rowLocations(TableType.TRACKS).map((loc) => this.buf.readUInt32LE(loc + 0x14)))
++    const seen = new Set(trackRows.map((t) => t.masterContentId))
+     const unique = opts.masterContentId ?? (seen.size ? Math.max(...seen) : 0x00100000) + 1
+ 
+     const dotIndex = filePath.lastIndexOf('.')
+@@ -835,7 +864,7 @@
+     offsets.forEach((o, i) => offsetsBuf.writeUInt16LE(o, i * 2))
+ 
+     const row = Buffer.concat([fixed, offsetsBuf, ...blobParts])
+-    this.appendRow(TableType.TRACKS, row, alloc, 2)
++    this.appendCachedRow(TableType.TRACKS, { id: trackId, masterContentId: unique }, row, alloc, 2)
+     return trackId
+   }
+ 
+@@ -861,18 +890,19 @@
+   }
+ 
+   addToPlaylist(playlistId: number, trackId: number, entryIndex?: number): void {
+-    const node = this.db.playlistTree.find((n) => n.id === playlistId)
++    const node = this.cachedRows<PlaylistTreeNode>(TableType.PLAYLIST_TREE).find((n) => n.id === playlistId)
+     if (!node || node.isFolder) throw new Error(`no playlist with id ${playlistId}`)
++    const entries = this.cachedRows<PlaylistEntry>(TableType.PLAYLIST_ENTRIES)
+     let index = entryIndex
+     if (index === undefined) {
+-      const existing = this.db.playlistEntries.filter((e) => e.playlistId === playlistId).map((e) => e.entryIndex)
++      const existing = entries.filter((e) => e.playlistId === playlistId).map((e) => e.entryIndex)
+       index = (existing.length ? Math.max(...existing) : 0) + 1
+     }
+     const row = Buffer.alloc(12)
+     row.writeUInt32LE(index, 0)
+     row.writeUInt32LE(trackId, 4)
+     row.writeUInt32LE(playlistId, 8)
+-    this.appendRow(TableType.PLAYLIST_ENTRIES, row, 12)
++    this.appendCachedRow(TableType.PLAYLIST_ENTRIES, { entryIndex: index, trackId, playlistId }, row, 12)
+   }
+ }
+ 
